@@ -1,6 +1,6 @@
 /*
  *
- * Copyright (C) 2019-2023 Intel Corporation
+ * Copyright (C) 2019-2025 Intel Corporation
  *
  * SPDX-License-Identifier: MIT
  *
@@ -19,607 +19,560 @@ namespace lzt = level_zero_tests;
 
 namespace {
 
-enum shared_memory_type { SHARED_LOCAL, SHARED_CROSS, SHARED_SYSTEM };
+struct DriverInfo {
+  ze_driver_handle_t driver_handle;
+  std::vector<ze_device_handle_t> device_handles{};
+  std::vector<ze_device_properties_t> device_properties{};
+  std::vector<ze_device_compute_properties_t> device_compute_properties{};
+  std::vector<std::vector<ze_device_memory_properties_t>>
+      device_memory_properties{};
+  /*
+   * sharedSystemAllocCapabilities
+   * 	ZE_MEMORY_ACCESS_NONE, ZE_MEMORY_ACCESS, ZE_MEMORY_ATOMIC_ACCESS
+   * 	ZE_MEMORY_CONCURENT_ACCESS, ZE_MEMORY_CONCURRENT_ATOMIC_ACCESS
+   *
+   * 	There is one ze_device_memory_access_properties_t per device handle
+   */
+  std::vector<ze_device_memory_access_properties_t>
+      device_memory_access_properties{};
 
-class zeDriverMemoryOvercommitTests
+  DriverInfo(ze_driver_handle_t driver_handle) : driver_handle(driver_handle) {}
+};
+
+static int count = 0;
+
+struct UsmDeleter {
+  ze_context_handle_t ctx{};
+  bool system_alloc{}; 
+  void operator()(uint64_t *p) const noexcept {
+    if (!p)
+      return;
+    lzt::free_memory_with_allocator_selector(ctx, p, system_alloc);
+    //count--;
+    //LOG_INFO << count;
+  }
+};
+
+inline std::unique_ptr<uint64_t, UsmDeleter>
+alloc_device_usm(ze_context_handle_t ctx, uint32_t ordinal,
+                                        ze_device_handle_t device, size_t size) {
+  return std::unique_ptr<uint64_t, UsmDeleter>(
+      static_cast<uint64_t *>(
+          lzt::allocate_device_memory(size, 8, 0, ordinal, device, ctx)),
+      UsmDeleter{ctx, false});
+}
+
+inline std::unique_ptr<uint64_t, UsmDeleter>
+alloc_shared_usm(ze_context_handle_t ctx, ze_device_handle_t device, size_t size) {
+  //count++;
+  //LOG_INFO << count;
+  return std::unique_ptr<uint64_t, UsmDeleter>(
+    static_cast<uint64_t *>(
+          lzt::allocate_shared_memory(size, 8, 0, 0, device, ctx)),
+      UsmDeleter{ctx, false});
+}
+
+inline std::unique_ptr<uint64_t, UsmDeleter>
+alloc_system_usm (ze_context_handle_t ctx, size_t size) {
+  return std::unique_ptr<uint64_t, UsmDeleter>(new uint64_t[size / sizeof(uint64_t)],
+      UsmDeleter{ctx, true});
+}
+
+enum class BufferType { Device, Shared, SharedSystem };
+
+struct GpuBuffer {
+  uint64_t *data;
+};
+
+struct MemoryOvercommitData {
+  BufferType buffer_type = BufferType::Shared;
+
+  std::vector<std::unique_ptr<uint64_t, UsmDeleter>> gpu_stress_buffers;
+  std::vector<std::unique_ptr<uint64_t, UsmDeleter>> gpu_verify_buffers;
+  
+  std::unique_ptr<uint64_t, UsmDeleter> gpu_stress_ptrs_buffer;
+  std::unique_ptr<uint64_t, UsmDeleter> gpu_verify_ptrs_buffer;
+  
+  std::vector<GpuBuffer> host_stress_buffers;
+  std::vector<GpuBuffer> host_verify_buffers;
+
+  std::unique_ptr<uint64_t[]> host_found_output_buffer;
+
+  uint32_t output_count = 64u;
+  size_t output_size = output_count * sizeof(uint64_t);
+
+  uint64_t num_stress_allocs = 0;
+  uint64_t stress_alloc_size = 0;
+
+  uint64_t num_verify_allocs = 0;
+  uint64_t verify_alloc_size = 0;
+
+  void initialize() {
+    LOG_INFO << num_stress_allocs << " " << stress_alloc_size;
+    host_found_output_buffer =
+        std::make_unique<uint64_t[]>(num_verify_allocs * 16);
+      switch (buffer_type) {
+      case BufferType::Device:
+        for (uint64_t i = 0; i < num_stress_allocs; ++i) {
+          gpu_stress_buffers.push_back(std::move(alloc_device_usm(
+              context_, device_ordinal_,
+                                          device_handle_,
+                                 stress_alloc_size)));
+        }
+        for (uint64_t i = 0; i < num_verify_allocs; ++i) {
+          gpu_verify_buffers.push_back(std::move(alloc_device_usm(
+              context_, device_ordinal_, device_handle_, verify_alloc_size)));
+        }
+        gpu_stress_ptrs_buffer =
+            alloc_device_usm(context_, device_ordinal_, device_handle_,
+                             num_stress_allocs * sizeof(GpuBuffer));
+        gpu_verify_ptrs_buffer =
+            alloc_device_usm(context_, device_ordinal_, device_handle_,
+                             num_verify_allocs * sizeof(GpuBuffer));
+        break;
+      case BufferType::Shared:
+        for (uint64_t i = 0; i < num_stress_allocs; ++i) {
+          gpu_stress_buffers.push_back(std::move(
+              alloc_shared_usm(context_, device_handle_, stress_alloc_size)));
+          std::memset(gpu_stress_buffers.back().get(), 0, stress_alloc_size);
+        }
+        for (uint64_t i = 0; i < num_verify_allocs; ++i) {
+          gpu_verify_buffers.push_back(std::move(
+              alloc_shared_usm(context_, device_handle_, verify_alloc_size)));
+          std::memset(gpu_verify_buffers.back().get(), 0, verify_alloc_size);
+        }
+        gpu_stress_ptrs_buffer = alloc_shared_usm(
+            context_, device_handle_, num_stress_allocs * sizeof(GpuBuffer));
+        gpu_verify_ptrs_buffer = alloc_shared_usm(
+            context_, device_handle_, num_verify_allocs * sizeof(GpuBuffer));
+        break;
+      case BufferType::SharedSystem:
+        for (uint64_t i = 0; i < num_stress_allocs; ++i) {
+          gpu_stress_buffers.push_back(
+              std::move(alloc_system_usm(context_, stress_alloc_size)));
+        }
+        for (uint64_t i = 0; i < num_verify_allocs; ++i) {
+          gpu_verify_buffers.push_back(
+              std::move(alloc_system_usm(context_, verify_alloc_size)));
+        }
+        gpu_stress_ptrs_buffer =
+            alloc_system_usm(context_, num_stress_allocs * sizeof(GpuBuffer));
+        gpu_verify_ptrs_buffer =
+            alloc_system_usm(context_, num_verify_allocs * sizeof(GpuBuffer));
+        break;
+      }
+      host_stress_buffers.resize(num_stress_allocs);
+      host_verify_buffers.resize(num_verify_allocs);
+      for (uint64_t i = 0; i < num_stress_allocs; ++i) {
+        host_stress_buffers[i].data = gpu_stress_buffers[i].get();
+      }
+      for (uint64_t i = 0; i < num_verify_allocs; ++i) {
+        host_verify_buffers[i].data = gpu_verify_buffers[i].get();
+      }
+      memcpy(gpu_stress_ptrs_buffer.get(), host_stress_buffers.data(),
+             num_stress_allocs * sizeof(GpuBuffer));
+      memcpy(gpu_verify_ptrs_buffer.get(), host_verify_buffers.data(),
+             num_verify_allocs * sizeof(GpuBuffer));
+  }
+
+  void cleanup() {
+    gpu_stress_buffers.clear();
+    gpu_verify_buffers.clear();
+    gpu_stress_ptrs_buffer.reset();
+    gpu_verify_ptrs_buffer.reset();
+    host_stress_buffers.clear();
+    host_verify_buffers.clear();
+    host_found_output_buffer.reset();
+  }
+
+  ze_device_memory_access_properties_t device_memory_access_cap_{};
+  ze_context_handle_t context_ = nullptr;
+  ze_device_handle_t device_handle_ = nullptr;
+  uint32_t device_ordinal_ = 0u;
+};
+
+struct MemoryOvercommitWorkload {
+  MemoryOvercommitWorkload(
+                           uint32_t device_ordinal,
+                           std::unique_ptr<MemoryOvercommitData> data)
+      : 
+        device_ordinal_(device_ordinal),
+        data(std::move(data)) {}
+  std::unique_ptr<MemoryOvercommitData> data;
+
+  virtual const char *get_module_name() {
+    return "test_fill_device_memory_overcommit_indirect.spv";
+  }
+
+  void initialize(const DriverInfo &driver_info, size_t memory_size_multiple) {
+    driver_handle_ = driver_info.driver_handle;
+    context_ = lzt::create_context(driver_handle_);
+    device_handle_ = driver_info.device_handles[device_ordinal_];
+    module_handle_ =
+        lzt::create_module(context_, device_handle_, get_module_name(),
+                           ZE_MODULE_FORMAT_IL_SPIRV, nullptr, nullptr);
+    data->context_ = context_;
+    data->device_handle_ = device_handle_;
+    data->device_ordinal_ = device_ordinal_;
+    data->device_memory_access_cap_ =
+        driver_info.device_memory_access_properties[device_ordinal_];
+
+    // totalSize / 128 stress buffers
+    uint64_t total_stress_alloc_size = driver_info.device_memory_properties[device_ordinal_][0].totalSize;
+    uint64_t num_allocs = 128;
+    uint64_t stress_alloc_size = total_stress_alloc_size / num_allocs;
+    LOG_INFO << "Total allocatons size: " << total_stress_alloc_size;
+    LOG_INFO << "Number of allocations: " << num_allocs;
+    LOG_INFO << "Single allocaton size: " << stress_alloc_size;
+    
+    data->num_stress_allocs = num_allocs;
+    data->stress_alloc_size = stress_alloc_size;
+
+    // 1024 verify buffers of 1MB each
+    data->num_verify_allocs = false ? 8 : 1024;
+    data->verify_alloc_size = false ? 1024 : 1024ull * 1024ull;
+  }
+
+  virtual void inject_stress_function() {}
+  virtual void inject_verify_function() {}
+
+  void run(bool immediate) {
+    data->initialize();
+    LOG_INFO << "Buffers initialized";
+
+        cmd_bundle_ = lzt::create_command_bundle(
+        context_, device_handle_, 0, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS,
+        ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0, 0, 0, immediate);
+
+    stress_function_ =
+        lzt::create_function(module_handle_, "fill_device_memory");
+        inject_stress_function();
+    verify_function_ =
+        lzt::create_function(module_handle_, "fill_device_memory");
+        inject_verify_function();
+
+    uint32_t group_size_x = 256;
+    ze_group_count_t group_count_stress = {
+        (data->stress_alloc_size / sizeof(uint64_t) + group_size_x * 16 - 1) /
+            (group_size_x * 16),
+                                    data->num_stress_allocs, 1};
+    lzt::set_group_size(stress_function_, group_size_x, 1,
+                        1);
+
+    auto gpu_stress_ptrs_buffer_ptr = data->gpu_stress_ptrs_buffer.get();
+    lzt::set_argument_value(stress_function_, 0,
+                            sizeof(gpu_stress_ptrs_buffer_ptr),
+                            &gpu_stress_ptrs_buffer_ptr);
+    lzt::set_argument_value(stress_function_, 1,
+                            sizeof(data->stress_alloc_size),
+                            &data->stress_alloc_size);
+
+    // Not used yet
+    uint64_t stress_value = 0xDEADBEEF;
+    lzt::set_argument_value(stress_function_, 2, sizeof(stress_value),
+                            &stress_value);
+
+   ze_group_count_t group_count_verify = {
+        (data->verify_alloc_size / sizeof(uint64_t) + group_size_x * 16 - 1) /
+            (group_size_x * 16),
+       data->num_verify_allocs, 1};
+    lzt::set_group_size(verify_function_, group_size_x, 1, 1);
+
+   auto gpu_verify_ptr_buffer_ptr = data->gpu_verify_ptrs_buffer.get();
+   lzt::set_argument_value(verify_function_, 0,
+                           sizeof(gpu_verify_ptr_buffer_ptr),
+                           &gpu_verify_ptr_buffer_ptr);
+   lzt::set_argument_value(verify_function_, 1, sizeof(data->verify_alloc_size),
+                           &data->verify_alloc_size);
+   
+   // Not used yet
+   uint64_t verify_value = 0xDEADBEEFDEADBEEF;
+   lzt::set_argument_value(verify_function_, 2, sizeof(verify_value),
+                           &verify_value);
+
+
+   // Launch first op on verify buffers (increment by 1, expected element value after = 1);
+   lzt::append_launch_function(cmd_bundle_.list, verify_function_,
+                               &group_count_verify, nullptr, 0, nullptr);
+   lzt::append_barrier(cmd_bundle_.list);
+   if (!immediate) {
+     lzt::close_command_list(cmd_bundle_.list);
+   }
+   lzt::execute_and_sync_command_bundle(cmd_bundle_, UINT64_MAX);
+   if (!immediate) {
+     lzt::reset_command_list(cmd_bundle_.list);
+   }
+
+   // Launch stress function (Based on totalSize);
+   for (int i = 0; i < 3; ++i) {
+     lzt::append_launch_function(cmd_bundle_.list, stress_function_,
+                                 &group_count_stress, nullptr, 0, nullptr);
+     lzt::append_barrier(cmd_bundle_.list);
+   }
+   if (!immediate) {
+     lzt::close_command_list(cmd_bundle_.list);
+   }
+   lzt::execute_and_sync_command_bundle(cmd_bundle_, UINT64_MAX);
+   if (!immediate) {
+     lzt::reset_command_list(cmd_bundle_.list);
+   }
+
+   // Launch second op on verify buffers (increment by 1, expected element value after = 2);
+   lzt::append_launch_function(cmd_bundle_.list, verify_function_,
+                               &group_count_verify, nullptr, 0, nullptr);
+   lzt::append_barrier(cmd_bundle_.list);
+
+   // Read 16 elements of each verify buffer to host
+   for (int i = 0; i < data->num_verify_allocs; ++i) {
+     lzt::append_memory_copy(cmd_bundle_.list,
+                             data->host_found_output_buffer.get() + i * 16,
+                             data->gpu_verify_buffers[i].get(), 128, nullptr);
+     lzt::append_barrier(cmd_bundle_.list);
+   }
+   if (!immediate) {
+     lzt::close_command_list(cmd_bundle_.list);
+   }
+   lzt::execute_and_sync_command_bundle(cmd_bundle_, UINT64_MAX);
+
+    verify();
+
+    data->cleanup();
+  }
+
+  void verify() {
+    LOG_INFO << "verify output";
+
+    // Print first element of all verify buffers
+    for (uint32_t i = 0; i < data->num_verify_allocs; i++) {
+      for (uint32_t j = 0; j < 1; j++) {
+        std::cout << std::hex << data->host_found_output_buffer[i * 16 + j]
+                  << " ";
+      }
+    }
+  }
+
+  ~MemoryOvercommitWorkload() {
+    lzt::destroy_command_bundle(cmd_bundle_);
+    lzt::destroy_function(stress_function_);
+    lzt::destroy_function(verify_function_);
+    lzt::destroy_module(module_handle_);
+    lzt::destroy_context(context_);
+  }
+
+public:
+  uint32_t device_ordinal_ = 0u;
+
+  ze_kernel_handle_t stress_function_ = nullptr;
+  ze_kernel_handle_t verify_function_ = nullptr;
+  lzt::zeCommandBundle cmd_bundle_{};
+
+  ze_driver_handle_t driver_handle_ = nullptr;
+  ze_context_handle_t context_ = nullptr;
+  ze_device_handle_t device_handle_ = nullptr;
+  ze_module_handle_t module_handle_ = nullptr;
+};
+
+struct MemoryOvercommitIndirectAccessWorkload : public MemoryOvercommitWorkload {
+  using MemoryOvercommitWorkload::MemoryOvercommitWorkload;
+  void inject_stress_function() override {
+    lzt::kernel_set_indirect_access(stress_function_,
+                                    ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE);
+  }
+  void inject_verify_function() override {
+    lzt::kernel_set_indirect_access(verify_function_,
+                                    ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE);
+  }
+};
+
+
+struct MemoryOvercommitArgs {
+  uint32_t memory_size_multiple;
+  /* Whether to use immediate command list in the test */
+  bool is_immediate;
+};
+
+class zeMemoryOvercommitTests
     : public ::testing::Test,
-      public ::testing::WithParamInterface<
-          std::tuple<uint32_t, uint32_t, uint32_t, bool>> {
-protected:
-  ze_module_handle_t create_module(ze_context_handle_t context,
-                                   const ze_device_handle_t device,
-                                   const std::string path) {
-    const std::vector<uint8_t> binary_file = lzt::load_binary_file(path);
+      public ::testing::WithParamInterface<std::tuple<uint32_t, bool>> {
+public:
+  MemoryOvercommitArgs args{};
+  std::unique_ptr<MemoryOvercommitWorkload> workload;
 
-    LOG_INFO << "set up module description for path " << path;
-    ze_module_desc_t module_description = {};
-    module_description.stype = ZE_STRUCTURE_TYPE_MODULE_DESC;
+  void SetUp() override {
+    args.memory_size_multiple = std::get<0>(GetParam());
+    args.is_immediate = std::get<1>(GetParam());
 
-    module_description.pNext = nullptr;
-    module_description.format = ZE_MODULE_FORMAT_IL_SPIRV;
-    module_description.inputSize = static_cast<uint32_t>(binary_file.size());
-    module_description.pInputModule = binary_file.data();
-    module_description.pBuildFlags = nullptr;
-
-    ze_module_handle_t module = nullptr;
-    EXPECT_ZE_RESULT_SUCCESS(
-        zeModuleCreate(context, device, &module_description, &module, nullptr));
-
-    LOG_INFO << "return module";
-    return module;
-  }
-
-  void run_functions(const ze_device_handle_t device, ze_module_handle_t module,
-                     void *pattern_memory, uint64_t pattern_memory_count,
-                     uint16_t sub_pattern,
-                     uint64_t *host_expected_output_buffer,
-                     uint64_t *gpu_expected_output_buffer,
-                     uint64_t *host_found_output_buffer,
-                     uint64_t *gpu_found_output_buffer, uint32_t output_count,
-                     ze_context_handle_t context, bool is_immediate) {
-    ze_kernel_desc_t fill_function_description = {};
-    fill_function_description.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
-
-    fill_function_description.pNext = nullptr;
-    fill_function_description.flags = 0;
-    fill_function_description.pKernelName = "fill_device_memory";
-
-    /* Prepare the fill function */
-    ze_kernel_handle_t fill_function = nullptr;
-    EXPECT_ZE_RESULT_SUCCESS(
-        zeKernelCreate(module, &fill_function_description, &fill_function));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetGroupSize(fill_function, 1, 1, 1));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        fill_function, 0, sizeof(pattern_memory), &pattern_memory));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        fill_function, 1, sizeof(pattern_memory_count), &pattern_memory_count));
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        fill_function, 2, sizeof(sub_pattern), &sub_pattern));
-
-    ze_kernel_desc_t test_function_description = {};
-    test_function_description.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC;
-
-    test_function_description.pNext = nullptr;
-    test_function_description.flags = 0;
-    test_function_description.pKernelName = "test_device_memory";
-
-    /* Prepare the test function */
-    ze_kernel_handle_t test_function = nullptr;
-    EXPECT_ZE_RESULT_SUCCESS(
-        zeKernelCreate(module, &test_function_description, &test_function));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetGroupSize(test_function, 1, 1, 1));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        test_function, 0, sizeof(pattern_memory), &pattern_memory));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        test_function, 1, sizeof(pattern_memory_count), &pattern_memory_count));
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        test_function, 2, sizeof(sub_pattern), &sub_pattern));
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        test_function, 3, sizeof(gpu_expected_output_buffer),
-        &gpu_expected_output_buffer));
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        test_function, 4, sizeof(gpu_found_output_buffer),
-        &gpu_found_output_buffer));
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelSetArgumentValue(
-        test_function, 5, sizeof(output_count), &output_count));
-
-    auto cmd_bundle = lzt::create_command_bundle(
-        context, device, 0, ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS,
-        ZE_COMMAND_QUEUE_PRIORITY_NORMAL, 0, 0, 0, is_immediate);
-
-    ze_group_count_t thread_group_dimensions = {1, 1, 1};
-
-    lzt::append_memory_copy(cmd_bundle.list, gpu_expected_output_buffer,
-                            host_expected_output_buffer,
-                            output_count * sizeof(uint64_t), nullptr);
-    lzt::append_memory_copy(cmd_bundle.list, gpu_found_output_buffer,
-                            host_found_output_buffer,
-                            output_count * sizeof(uint64_t), nullptr);
-
-    EXPECT_ZE_RESULT_SUCCESS(zeCommandListAppendLaunchKernel(
-        cmd_bundle.list, fill_function, &thread_group_dimensions, nullptr, 0,
-        nullptr));
-
-    EXPECT_ZE_RESULT_SUCCESS(
-        zeCommandListAppendBarrier(cmd_bundle.list, nullptr, 0, nullptr));
-
-    EXPECT_ZE_RESULT_SUCCESS(zeCommandListAppendLaunchKernel(
-        cmd_bundle.list, test_function, &thread_group_dimensions, nullptr, 0,
-        nullptr));
-
-    EXPECT_ZE_RESULT_SUCCESS(
-        zeCommandListAppendBarrier(cmd_bundle.list, nullptr, 0, nullptr));
-
-    lzt::append_memory_copy(cmd_bundle.list, host_expected_output_buffer,
-                            gpu_expected_output_buffer,
-                            output_count * sizeof(uint64_t), nullptr);
-
-    lzt::append_memory_copy(cmd_bundle.list, host_found_output_buffer,
-                            gpu_found_output_buffer,
-                            output_count * sizeof(uint64_t), nullptr);
-
-    EXPECT_ZE_RESULT_SUCCESS(
-        zeCommandListAppendBarrier(cmd_bundle.list, nullptr, 0, nullptr));
-
-    lzt::close_command_list(cmd_bundle.list);
-    lzt::execute_and_sync_command_bundle(cmd_bundle, UINT64_MAX);
-    lzt::destroy_command_bundle(cmd_bundle);
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelDestroy(fill_function));
-    EXPECT_ZE_RESULT_SUCCESS(zeKernelDestroy(test_function));
-  }
-
-  void collect_drivers_info() {
-
-    uint32_t driver_count = 0;
-
-    LOG_INFO << "collect driver information";
-
-    ze_driver_handle_t *driver_handles;
-    EXPECT_ZE_RESULT_SUCCESS(zeDriverGet(&driver_count, NULL));
-    EXPECT_NE(0, driver_count);
-
-    driver_handles = new ze_driver_handle_t[driver_count];
-    EXPECT_ZE_RESULT_SUCCESS(zeDriverGet(&driver_count, driver_handles));
-
-    LOG_INFO << "number of drivers " << driver_count;
-
-    struct DriverInfo *driver_info;
-    driver_info = new struct DriverInfo[driver_count];
-
-    for (uint32_t i = 0; i < driver_count; i++) {
-
-      driver_info[i].driver_handle = driver_handles[i];
-
-      uint32_t device_count = 0;
-      EXPECT_ZE_RESULT_SUCCESS(
-          zeDeviceGet(driver_handles[i], &device_count, NULL));
-      EXPECT_NE(0, device_count);
-      driver_info[i].device_handles = new ze_device_handle_t[device_count];
-      EXPECT_ZE_RESULT_SUCCESS(zeDeviceGet(driver_handles[i], &device_count,
-                                           driver_info[i].device_handles));
-      driver_info[i].number_device_handles = device_count;
-
-      LOG_INFO << "there are " << device_count << " devices in driver " << i;
-
-      /* one ze_device_properties_t for each device in the driver */
-      driver_info[i].device_properties =
-          new ze_device_properties_t[device_count];
-      for (uint32_t j = 0; j < device_count; j++) {
-        driver_info[i].device_properties[j] = {};
-        driver_info[i].device_properties[j].stype =
-            ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-      }
-
-      for (uint32_t j = 0; j < device_count; j++) {
-        EXPECT_ZE_RESULT_SUCCESS(
-            zeDeviceGetProperties(driver_info[i].device_handles[j],
-                                  &driver_info[i].device_properties[j]));
-        LOG_INFO << "zeDeviceGetProperties device " << j;
-        LOG_INFO << " name " << driver_info[i].device_properties[j].name
-                 << " type "
-                 << ((driver_info[i].device_properties[j].type ==
-                      ZE_DEVICE_TYPE_GPU)
-                         ? " GPU "
-                         : " FPGA ");
-      }
-
-      /* one ze_device_compute_properties_t for device in the driver */
-      driver_info[i].device_compute_properties =
-          new ze_device_compute_properties_t[device_count];
-      for (uint32_t j = 0; j < device_count; j++) {
-        driver_info[i].device_compute_properties[j].stype =
-            ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES;
-      }
-
-      for (uint32_t j = 0; j < device_count; j++) {
-        EXPECT_ZE_RESULT_SUCCESS(zeDeviceGetComputeProperties(
-            driver_info[i].device_handles[j],
-            &driver_info[i].device_compute_properties[j]));
-        LOG_INFO << "zeDeviceGetComputeProperties device " << j;
-        LOG_INFO
-            << "maxSharedLocalMemory "
-            << driver_info[i].device_compute_properties[j].maxSharedLocalMemory;
-      }
-
-      uint32_t device_memory_properties_count = 1;
-      driver_info[i].device_memory_properties =
-          new ze_device_memory_properties_t[device_memory_properties_count];
-      for (uint32_t j = 0; j < device_memory_properties_count; j++) {
-        driver_info[i].device_memory_properties[j].pNext = nullptr;
-        driver_info[i].device_memory_properties[j].stype =
-            ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
-
-        EXPECT_ZE_RESULT_SUCCESS(zeDeviceGetMemoryProperties(
-            driver_info[i].device_handles[j], &device_memory_properties_count,
-            &driver_info[i].device_memory_properties[j]));
-        LOG_INFO << "ze_device_memory_properties_t device " << j;
-        LOG_INFO << "totalSize "
-                 << driver_info[i].device_memory_properties[j].totalSize;
-      }
-      driver_info[i].device_memory_access_properties =
-          new ze_device_memory_access_properties_t[device_count];
-      for (uint32_t j = 0; j < device_count; j++) {
-        driver_info[i].device_memory_access_properties[j].pNext = nullptr;
-        driver_info[i].device_memory_access_properties[j].stype =
-            ZE_STRUCTURE_TYPE_DEVICE_MEMORY_ACCESS_PROPERTIES;
-
-        EXPECT_ZE_RESULT_SUCCESS(zeDeviceGetMemoryAccessProperties(
-            driver_info[i].device_handles[j],
-            &driver_info[i].device_memory_access_properties[j]));
-      }
-    }
-
-    DriverInfo_ = driver_info;
-    DriverInfoCount_ = driver_count;
-
-    delete[] driver_handles;
-  }
-
-  void free_drivers_info() {
-
-    LOG_INFO << "free driver information";
-
-    for (uint32_t i = 0; i < DriverInfoCount_; i++) {
-      delete[] DriverInfo_[i].device_handles;
-      delete[] DriverInfo_[i].device_properties;
-      delete[] DriverInfo_[i].device_compute_properties;
-      delete[] DriverInfo_[i].device_memory_properties;
-      delete[] DriverInfo_[i].device_memory_access_properties;
-    }
-
-    delete[] DriverInfo_;
-  }
-
-  void test_memory_overcommit(uint32_t driver_index,
-                              uint32_t device_in_driver_index,
-                              uint32_t memory_size_multiple,
-                              ze_memory_type_t memory_type,
-                              shared_memory_type shr_mem_type,
-                              bool is_immediate) {
-
-    LOG_INFO << "TEST ARGUMENTS "
-             << "driver_index " << driver_index << " device_in_driver_index "
-             << device_in_driver_index << " memory_size_multiple "
-             << memory_size_multiple;
+    LOG_INFO << "TEST args "
+             << "memory_size_multiple=" << args.memory_size_multiple
+             << " is_immediate=" << args.is_immediate;
 
     collect_drivers_info();
 
-    EXPECT_LT(driver_index, DriverInfoCount_);
-    EXPECT_LT(device_in_driver_index,
-              DriverInfo_[driver_index].number_device_handles);
+    DriverInfo &driver_info = drivers_info_[driver_ordinal_];
+    
+    LOG_INFO << "driver ordinal " << driver_ordinal_;
+    LOG_INFO << "device ordinal " << device_ordinal_;
 
-    DriverInfo_t *driver_info = &DriverInfo_[driver_index];
+    bool loop = false;
+    while (loop)
+      ;
 
-    ze_driver_handle_t driver_handle = driver_info->driver_handle;
-    ze_context_handle_t context = lzt::create_context(driver_handle);
+    LOG_INFO
+        << "totalSize "
+        << driver_info.device_memory_properties[device_ordinal_][0].totalSize;
+    
+    LOG_INFO << "maxSharedLocalMemory "
+             << driver_info.device_compute_properties[device_ordinal_]
+                    .maxSharedLocalMemory;
+  }
+protected:
+  void collect_drivers_info() {
+    LOG_INFO << "collect driver information";
 
-    ze_device_handle_t device_handle =
-        driver_info->device_handles[device_in_driver_index];
+    auto driver_handles = lzt::get_all_driver_handles();
 
-    uint32_t maxSharedLocalMemory =
-        driver_info->device_compute_properties[device_in_driver_index]
-            .maxSharedLocalMemory;
-    uint64_t totalSize =
-        driver_info->device_memory_properties[device_in_driver_index].totalSize;
-
-    size_t pattern_memory_size = memory_size_multiple * maxSharedLocalMemory;
-    uint64_t pattern_memory_count =
-        pattern_memory_size >> 3; // array of uint64_t
-
-    uint64_t *gpu_pattern_buffer;
-    uint64_t *gpu_expected_output_buffer;
-    uint64_t *gpu_found_output_buffer;
-    ze_device_memory_access_properties_t &device_properties =
-        driver_info->device_memory_access_properties[device_in_driver_index];
-    if (memory_type == ZE_MEMORY_TYPE_DEVICE) {
-      auto memory_access_cap = device_properties.deviceAllocCapabilities;
-      if ((memory_access_cap & ZE_MEMORY_ACCESS_CAP_FLAG_RW) == 0) {
-        LOG_INFO << "WARNING: Unable to allocate device memory, skipping";
-        free_drivers_info();
-        GTEST_SKIP();
-      }
-      gpu_pattern_buffer = (uint64_t *)level_zero_tests::allocate_device_memory(
-          pattern_memory_size, 8, 0, use_this_ordinal_on_device_, device_handle,
-          context);
-      gpu_expected_output_buffer =
-          (uint64_t *)level_zero_tests::allocate_device_memory(
-              output_size_, 8, 0, use_this_ordinal_on_device_, device_handle,
-              context);
-      gpu_found_output_buffer =
-          (uint64_t *)level_zero_tests::allocate_device_memory(
-              output_size_, 8, 0, use_this_ordinal_on_device_, device_handle,
-              context);
-    } else if (memory_type == ZE_MEMORY_TYPE_SHARED) {
-      if (shr_mem_type == SHARED_LOCAL) {
-        auto memory_access_cap =
-            device_properties.sharedSingleDeviceAllocCapabilities;
-        if ((memory_access_cap & ZE_MEMORY_ACCESS_CAP_FLAG_RW) == 0) {
-          LOG_INFO << "WARNING: Unable to allocate shared single device "
-                      "memory, skipping";
-          free_drivers_info();
-          GTEST_SKIP();
-        }
-        gpu_pattern_buffer =
-            (uint64_t *)level_zero_tests::allocate_shared_memory(
-                pattern_memory_size, 8, 0u, 0u, device_handle, context);
-        gpu_expected_output_buffer =
-            (uint64_t *)level_zero_tests::allocate_shared_memory(
-                output_size_, 8, 0u, 0u, device_handle, context);
-        gpu_found_output_buffer =
-            (uint64_t *)level_zero_tests::allocate_shared_memory(
-                output_size_, 8, 0u, 0u, device_handle, context);
-      } else if (shr_mem_type == SHARED_SYSTEM) { // system allocation
-        if (!lzt::supports_shared_system_alloc(device_properties)) {
-          LOG_INFO
-              << "WARNING: Unable to allocate shared system memory, skipping";
-          free_drivers_info();
-          GTEST_SKIP();
-        }
-        gpu_pattern_buffer = new uint64_t[output_count_];
-        gpu_expected_output_buffer = new uint64_t[output_count_];
-        gpu_found_output_buffer = new uint64_t[output_count_];
-      } else if (shr_mem_type == SHARED_CROSS) {
-        auto memory_access_cap =
-            device_properties.sharedCrossDeviceAllocCapabilities;
-        if ((memory_access_cap & ZE_MEMORY_ACCESS_CAP_FLAG_RW) == 0) {
-          LOG_INFO
-              << "WARNING: Unable to allocate shared cross memory, skipping";
-          free_drivers_info();
-          GTEST_SKIP();
-        }
-        uint32_t next_device_index = device_in_driver_index;
-        // find the first available device to use the memory
-        for (auto i = 0u; i < driver_info->number_device_handles; i++) {
-          if (i != device_in_driver_index) {
-            LOG_INFO << "Selecting device " << i << "to test overcommit";
-            next_device_index = i;
-            break;
-          }
-        }
-        // if there is only one device available, skip the test
-        if (next_device_index == device_in_driver_index) {
-          LOG_INFO << "WARNING: Cannot find another device to launch kernel, "
-                      "skipping";
-          free_drivers_info();
-          GTEST_SKIP();
-        }
-        gpu_pattern_buffer =
-            (uint64_t *)level_zero_tests::allocate_shared_memory(
-                pattern_memory_size, 8, 0, 0u, device_handle, context);
-        gpu_expected_output_buffer =
-            (uint64_t *)level_zero_tests::allocate_shared_memory(
-                output_size_, 8, 0, 0u, device_handle, context);
-        gpu_found_output_buffer =
-            (uint64_t *)level_zero_tests::allocate_shared_memory(
-                output_size_, 8, 0, 0u, device_handle, context);
-        // overwrite device_handle to call run_function()
-        device_handle = driver_info->device_handles[next_device_index];
-        if (!lzt::can_access_peer(
-                driver_info->device_handles[device_in_driver_index],
-                driver_info->device_handles[next_device_index])) {
-          LOG_INFO << "WARNING: Cannot access this memory on the next device, "
-                      "skipping";
-          free_drivers_info();
-          GTEST_SKIP();
-        }
-      } else {
-        LOG_INFO << "WARNING: Unknown memory type, skipping";
-        free_drivers_info();
-        GTEST_SKIP();
-      }
+    for (auto &handle : driver_handles) {
+      drivers_info_.push_back(handle);
     }
 
-    uint64_t *host_expected_output_buffer = new uint64_t[output_count_];
-    std::fill(host_expected_output_buffer,
-              host_expected_output_buffer + output_count_, 0);
+    for (uint32_t i = 0; i < drivers_info_.size(); ++i) {
+      auto &driver_info = drivers_info_[i];
 
-    uint64_t *host_found_output_buffer = new uint64_t[output_count_];
-    std::fill(host_found_output_buffer,
-              host_found_output_buffer + output_count_, 0);
+      driver_info.device_handles = lzt::get_devices(driver_info.driver_handle);
 
-    uint16_t pattern_base = lzt::generate_value<uint16_t>();
+      for (uint32_t j = 0; j < driver_info.device_handles.size(); ++j) {
+        auto device_handle = driver_info.device_handles[j];
 
-    LOG_INFO << "PREPARE TO RUN START";
-    LOG_INFO << "totalSize " << totalSize;
-    LOG_INFO << "maxSharedLocalMemory " << maxSharedLocalMemory;
-    LOG_INFO << "gpu_pattern_buffer " << gpu_pattern_buffer;
-    LOG_INFO << "pattern_memory_count " << pattern_memory_count;
-    LOG_INFO << "pattern_memory_size " << pattern_memory_size;
-    LOG_INFO << "pattern_base " << pattern_base;
-    LOG_INFO << "gpu_expected_output_buffer " << gpu_expected_output_buffer;
-    LOG_INFO << "host_expected_output_buffer " << host_expected_output_buffer;
-    LOG_INFO << "gpu_found_output_buffer " << gpu_found_output_buffer;
-    LOG_INFO << "host_found_output_buffer " << host_found_output_buffer;
-    LOG_INFO << "output count " << output_count_;
-    LOG_INFO << "output size " << output_size_;
-    LOG_INFO << "PREPARE TO RUN END";
+        driver_info.device_properties.emplace_back(
+            lzt::get_device_properties(device_handle));
 
-    LOG_INFO << "call create module";
-    ze_module_handle_t module_handle = create_module(
-        context, device_handle, "test_fill_device_memory_overcommit.spv");
+        driver_info.device_compute_properties.emplace_back(
+            lzt::get_compute_properties(device_handle));
 
-    LOG_INFO << "call run_functions";
-    run_functions(device_handle, module_handle, gpu_pattern_buffer,
-                  pattern_memory_count, pattern_base,
-                  host_expected_output_buffer, gpu_expected_output_buffer,
-                  host_found_output_buffer, gpu_found_output_buffer,
-                  output_count_, context, is_immediate);
+        driver_info.device_memory_properties.emplace_back(
+            lzt::get_memory_properties(device_handle));
 
-    LOG_INFO << "call free memory";
-    if (memory_type == ZE_MEMORY_TYPE_SHARED && shr_mem_type == SHARED_SYSTEM) {
-      delete[] gpu_pattern_buffer;
-      delete[] gpu_expected_output_buffer;
-      delete[] gpu_found_output_buffer;
-    } else {
-      level_zero_tests::free_memory(context, gpu_pattern_buffer);
-      level_zero_tests::free_memory(context, gpu_expected_output_buffer);
-      level_zero_tests::free_memory(context, gpu_found_output_buffer);
-    }
-    level_zero_tests::destroy_context(context);
-
-    LOG_INFO << "call destroy module";
-    EXPECT_ZE_RESULT_SUCCESS(zeModuleDestroy(module_handle));
-
-    LOG_INFO << "check output buffer";
-    bool memory_test_failure = false;
-    for (uint32_t i = 0; i < output_count_; i++) {
-      if (host_expected_output_buffer[i] || host_found_output_buffer[i]) {
-        LOG_INFO << "Index of difference " << i << " found "
-                 << host_found_output_buffer[i] << " expected "
-                 << host_expected_output_buffer[i];
-        memory_test_failure = true;
+        driver_info.device_memory_access_properties.emplace_back(
+            lzt::get_memory_access_properties(device_handle));
       }
     }
-
-    EXPECT_EQ(false, memory_test_failure);
-
-    free_drivers_info();
-    delete[] host_expected_output_buffer;
-    delete[] host_found_output_buffer;
   }
 
-  typedef struct DriverInfo {
-    ze_driver_handle_t driver_handle;
+  std::vector<DriverInfo> drivers_info_;
 
-    uint32_t number_device_handles;
-    ze_device_handle_t *device_handles;
+  uint32_t device_ordinal_ = 0u;
+  uint32_t driver_ordinal_ = 1u;
 
-    uint32_t number_device_properties;
-    ze_device_properties_t *device_properties;
-
-    uint32_t number_device_compute_properties;
-    ze_device_compute_properties_t *device_compute_properties;
-
-    uint32_t number_device_memory_properties;
-    ze_device_memory_properties_t *device_memory_properties;
-
-    /*
-     * sharedSystemAllocCapabilities
-     * 	ZE_MEMORY_ACCESS_NONE, ZE_MEMORY_ACCESS, ZE_MEMORY_ATOMIC_ACCESS
-     * 	ZE_MEMORY_CONCURENT_ACCESS, ZE_MEMORY_CONCURRENT_ATOMIC_ACCESS
-     *
-     * 	There is one ze_device_memory_access_properties_t per device handle
-     */
-    ze_device_memory_access_properties_t *device_memory_access_properties;
-  } DriverInfo_t;
-
-  DriverInfo_t *DriverInfo_;
-  uint32_t DriverInfoCount_;
-
-  typedef struct MemoryTestArguments {
-    /* The index into the driver array to test */
-    uint32_t driver_index;
-    /* The index array of devices in selected driver */
-    uint32_t device_in_driver_index;
-    /*
-     * number of multiples of maxSharedLocalMemory
-     * in zeDriverGetComputeProperties_t
-     * Will always be rounded down to a uint64_t
-     * multiple.
-     */
-    uint32_t memory_size_multiple;
-    /* Whether to use immediate command list in the test */
-    bool is_immediate;
-  } MemoryTestArguments_t;
-
-  uint32_t use_this_ordinal_on_device_ = 0;
-  uint32_t output_count_ = 64;
-  size_t output_size_ = output_count_ * sizeof(uint64_t);
+  uint32_t workload_runs = 1u;
 };
 
 LZT_TEST_P(
-    zeDriverMemoryOvercommitTests,
-    GivenDeviceMemoryWhenAllocationSizeLargerThanDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
-
-  MemoryTestArguments_t test_arguments = {
-      std::get<0>(GetParam()), // driver index
-      std::get<1>(GetParam()), // device index within driver
-      std::get<2>(GetParam()), // memory size multiple, rounded up to uint16_t
-      std::get<3>(GetParam())  // immediate command list
-  };
-
-  uint32_t driver_index = test_arguments.driver_index;
-  uint32_t device_in_driver_index = test_arguments.device_in_driver_index;
-  uint32_t memory_size_multiple = test_arguments.memory_size_multiple;
-  bool is_immediate = test_arguments.is_immediate;
-
-  test_memory_overcommit(driver_index, device_in_driver_index,
-                         memory_size_multiple, ZE_MEMORY_TYPE_DEVICE,
-                         SHARED_LOCAL, is_immediate);
+    zeMemoryOvercommitTests,
+    GivenDeviceMemoryWhenAllocationSizeLargerThenDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
+  if ((drivers_info_[driver_ordinal_]
+           .device_memory_access_properties[device_ordinal_]
+           .deviceAllocCapabilities &
+       ZE_MEMORY_ACCESS_CAP_FLAG_RW) == 0) {
+    GTEST_SKIP() << "Unable to allocate device memory";
+  }
+  workload = std::make_unique<MemoryOvercommitWorkload>(
+      device_ordinal_, std::make_unique<MemoryOvercommitData>());
+  for (uint32_t i = 0; i < workload_runs; ++i) {
+    workload->initialize(drivers_info_[driver_ordinal_],
+                         args.memory_size_multiple);
+    workload->run(args.is_immediate);
+  }
 }
 
 LZT_TEST_P(
-    zeDriverMemoryOvercommitTests,
-    GivenSharedMemoryWhenAllocationSizeLargerThanDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
-
-  MemoryTestArguments_t test_arguments = {
-      std::get<0>(GetParam()), // driver index
-      std::get<1>(GetParam()), // device index within driver
-      std::get<2>(GetParam()), // memory size multiple, rounded up to uint16_t
-      std::get<3>(GetParam())  // immediate command list
-  };
-
-  uint32_t driver_index = test_arguments.driver_index;
-  uint32_t device_in_driver_index = test_arguments.device_in_driver_index;
-  uint32_t memory_size_multiple = test_arguments.memory_size_multiple;
-  bool is_immediate = test_arguments.is_immediate;
-
-  test_memory_overcommit(driver_index, device_in_driver_index,
-                         memory_size_multiple, ZE_MEMORY_TYPE_SHARED,
-                         SHARED_LOCAL, is_immediate);
+    zeMemoryOvercommitTests,
+    GivenDeviceMemoryWithIndirectAccessWhenAllocationSizeLargerThenDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
+  if ((drivers_info_[driver_ordinal_]
+           .device_memory_access_properties[device_ordinal_]
+           .deviceAllocCapabilities &
+       ZE_MEMORY_ACCESS_CAP_FLAG_RW) == 0) {
+    GTEST_SKIP() << "Unable to allocate device memory";
+  }
+  workload = std::make_unique<MemoryOvercommitIndirectAccessWorkload>(
+      device_ordinal_, std::make_unique<MemoryOvercommitData>());
+  for (uint32_t i = 0; i < workload_runs; ++i) {
+    workload->initialize(drivers_info_[driver_ordinal_],
+                         args.memory_size_multiple);
+    workload->run(args.is_immediate);
+  }
 }
 
 LZT_TEST_P(
-    zeDriverMemoryOvercommitTests,
-    GivenSharedSystemMemoryWhenAllocationSizeLargerThanDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
-
-  MemoryTestArguments_t test_arguments = {
-      std::get<0>(GetParam()), // driver index
-      std::get<1>(GetParam()), // device index within driver
-      std::get<2>(GetParam()), // memory size multiple, rounded up to uint16_t
-      std::get<3>(GetParam())  // immediate command list
-  };
-
-  uint32_t driver_index = test_arguments.driver_index;
-  uint32_t device_in_driver_index = test_arguments.device_in_driver_index;
-  uint32_t memory_size_multiple = test_arguments.memory_size_multiple;
-  bool is_immediate = test_arguments.is_immediate;
-
-  test_memory_overcommit(driver_index, device_in_driver_index,
-                         memory_size_multiple, ZE_MEMORY_TYPE_SHARED,
-                         SHARED_SYSTEM, is_immediate);
+    zeMemoryOvercommitTests,
+    GivenSharedSingleDeviceMemoryWhenAllocationSizeLargerThenDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
+  if ((drivers_info_[driver_ordinal_]
+           .device_memory_access_properties[device_ordinal_]
+           .sharedSingleDeviceAllocCapabilities &
+       ZE_MEMORY_ACCESS_CAP_FLAG_RW) == 0) {
+    GTEST_SKIP() << "Unable to allocate shared single device memory";
+  }
+  workload = std::make_unique<MemoryOvercommitIndirectAccessWorkload>(
+      device_ordinal_, std::make_unique<MemoryOvercommitData>());
+  for (uint32_t i = 0; i < workload_runs; ++i) {
+    workload->initialize(drivers_info_[driver_ordinal_],
+                         args.memory_size_multiple);
+    workload->run(args.is_immediate);
+  }
 }
 
 LZT_TEST_P(
-    zeDriverMemoryOvercommitTests,
-    GivenSharedCrossMemoryWhenAllocationSizeLargerThanDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
-
-  MemoryTestArguments_t test_arguments = {
-      std::get<0>(GetParam()), // driver index
-      std::get<1>(GetParam()), // device index within driver
-      std::get<2>(GetParam()), // memory size multiple, rounded up to uint16_t
-      std::get<3>(GetParam())  // immediate command list
-  };
-
-  uint32_t driver_index = test_arguments.driver_index;
-  uint32_t device_in_driver_index = test_arguments.device_in_driver_index;
-  uint32_t memory_size_multiple = test_arguments.memory_size_multiple;
-  bool is_immediate = test_arguments.is_immediate;
-
-  test_memory_overcommit(driver_index, device_in_driver_index,
-                         memory_size_multiple, ZE_MEMORY_TYPE_SHARED,
-                         SHARED_CROSS, is_immediate);
+    zeMemoryOvercommitTests,
+    GivenSharedCrossDeviceMemoryWhenAllocationSizeLargerThenDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
+  std::vector<ze_device_handle_t> &device_handles =
+      drivers_info_[driver_ordinal_].device_handles;
+  if (device_handles.size() <
+      2) {
+    GTEST_SKIP() << "Test requires at least 2 devices";
+  }
+  uint32_t peer_device_ordinal = 0;
+  for (auto i = 0u; i < device_handles.size();
+       i++) {
+    if (i != device_ordinal_) {
+      peer_device_ordinal = i;
+      break;
+    }
+  }
+  if (lzt::can_access_peer(
+          device_handles[device_ordinal_],
+                           device_handles[peer_device_ordinal])) {
+    GTEST_SKIP() << "Devices do not have p2p access";
+  }
+  LOG_INFO << "Allocation on device " << device_ordinal_ << " launch on device "
+           << peer_device_ordinal;
+  workload = std::make_unique<MemoryOvercommitWorkload>(
+      device_ordinal_, std::make_unique<MemoryOvercommitData>());
+  for (uint32_t i = 0; i < workload_runs; ++i) {
+    workload->initialize(drivers_info_[driver_ordinal_],
+                         args.memory_size_multiple);
+    workload->device_ordinal_ = peer_device_ordinal;
+    workload->device_handle_ = device_handles[peer_device_ordinal];
+    workload->run(args.is_immediate);
+  }
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    TestAllInputPermuntations, zeDriverMemoryOvercommitTests,
-    ::testing::Combine(::testing::Values(0), ::testing::Values(0),
-                       ::testing::Values(1, 2, 4), ::testing::Bool()));
+LZT_TEST_P(
+    zeMemoryOvercommitTests,
+    GivenSharedSystemMemoryWhenAllocationSizeLargerThenDeviceMaxMemoryThenMemoryIsPagedOffAndOnTheDevice) {
+  if (!lzt::supports_shared_system_alloc(
+          drivers_info_[driver_ordinal_]
+              .device_memory_access_properties[device_ordinal_])) {
+    GTEST_SKIP() << "Unable to allocate shared system memory";
+  }
+  workload = std::make_unique<MemoryOvercommitWorkload>(
+      device_ordinal_, std::make_unique<MemoryOvercommitData>());
+  for (uint32_t i = 0; i < workload_runs; ++i) {
+    workload->initialize(drivers_info_[driver_ordinal_],
+                         args.memory_size_multiple);
+    workload->run(args.is_immediate);
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(TestAllInputPermuntations, zeMemoryOvercommitTests,
+    ::testing::Combine(::testing::Values(1), ::testing::Bool()));
 
 } // namespace
